@@ -1,0 +1,60 @@
+# =============================================================================
+# SCoRE Stage II 配置文件
+# =============================================================================
+# 论文公式: max E[r(y1) + r̃(y2)] - β·(KL_1 + KL_2)
+# 其中 r̃(y2) = r(y2) + α·(r(y2) - r(y1))
+# 目标: 同时优化 y1 和 y2，让模型学会自我纠错
+# =============================================================================
+
+# Model Configuration
+# ⚠️ 重要: 使用 Stage I 训练完成后的 checkpoint
+model_path: "/root/autodl-tmp/data/math500/cache/SCoRE/score_stage1/checkpoint-XXX"  # 替换为 Stage I 的最终 checkpoint
+cache_dir: "/root/autodl-tmp/data/math500/cache/"
+random_seed: 42
+wandb_project_name: 'SCoRE'
+
+# Dataset Configuration 
+task_type: "math"
+data_path: "data/math500"
+id_col: "unique_id"
+question_col: "problem"
+gold_col: "answer"
+
+run_name: "score_stage2"
+
+# Reward Function
+evaluator_mode: 'final'
+evaluator_function: 'math_acc'
+evaluator_answer_marker: 'Final Answer: The final answer is'
+
+# Generation Configuration
+few_shot_dir: "few_shots"
+number_output_initial_generations: 1
+
+# Sampling Parameters
+temperature: 0.8
+max_tokens: 512
+
+# =============================================================================
+# Stage II 训练参数 (论文 Table 8 MATH 任务)
+# =============================================================================
+train_stage: 2
+
+per_device_train_batch_size: 2
+gradient_accumulation_steps: 4
+local_rollout_forward_batch_size: 4
+total_episodes: 6000 # number of train samples seen. number of gradient steps = total_episodes / total batch 
+learning_rate: 2.0e-6
+num_warmup_steps: 100 # number of warmup steps in scheduler
+# 根据论文 Table 8 MATH 任务的超参数设置
+# Stage II 使用统一的 β1 (init_kl_coef) 对 y1 和 y2 都进行 KL 约束
+init_kl_coef: 0.01   # β1 = 0.01 (论文 Table 8，同时用于 y1 和 y2 的 KL 约束)
+corr_kl_coef: 0.01    # Stage II 不使用此参数，但保留以兼容代码（这是 Stage I 的 β2）
+stage2_alpha: 10     # α = 10 (reward bonus 系数，论文 Table 8)
+offline_y1_ratio: 0.3  # 30% 样本使用 base model y1（论文 Section 5.3，防止分布漂移）
+save_steps: 50       # save every <N> steps
+
+use_lora: True
+lora_rank: 32
+lora_alpha: 8
+lora_dropout: 0.1
