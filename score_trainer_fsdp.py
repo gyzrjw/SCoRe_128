@@ -297,6 +297,33 @@ class SCoRETrainer(Trainer):
         iter_dataloader = iter(repeat_generator())
         self.model.train()
 
+        # ================= [新增代码开始] =================
+        # 手动指定要恢复的 checkpoint 路径和步数
+        # resume_step = 300  # 你保存的 checkpoint 步数
+        # resume_path = "/root/autodl-tmp/data/math500/cache/SCoRE/score_stage2/checkpoint-300" # 请确认路径正确
+        
+        # if resume_step > 0:
+        #     print(f"🔥 Resuming training from step {resume_step}...")
+            
+        #     # 1. 加载 Policy 权重 (注意：只加载给 self.model，不要动 self.ref_policy)
+        #     # 你的代码使用了 Accelerator，所以最好通过 unwrap 加载，或者直接加载
+        #     # 这里假设保存的是 safetensors 或 bin，且是 LoRA 适配器
+        #     from peft import PeftModel
+        #     # 重新加载适配器权重
+        #     self.model.load_adapter(resume_path, adapter_name="default")
+            
+        #     # 2. 恢复状态变量
+        #     self.state.global_step = resume_step
+        #     self.state.episode = resume_step * args.batch_size
+            
+        #     # 注意：优化器状态(Optimizer State)在这里很难完美恢复，
+        #     # 因为你的代码是在 train 内部创建的 optimizer。
+        #     # 接受“学习率重新预热”通常是可以接受的。
+        # ================= [新增代码结束] =================
+
+        ema_stats = {} 
+        ema_alpha = 0.05  # 平滑系数
+
         for step_idx in range(1, args.num_total_batches + 1):
             data = next(iter_dataloader)
             self.state.episode += args.batch_size
@@ -316,27 +343,49 @@ class SCoRETrainer(Trainer):
                         # Stage I: 100% 使用 ref_policy (base model)
                         # 目标：学习如何纠正 base model 的次优答案
                         init_outputs, _ = batch_generation(
-                            self.ref_policy,
+                            self.ref_policy,  # ✓ 修复：Stage I 必须用 ref_policy
                             queries,
                             args.local_rollout_forward_batch_size,
                             self.processing_class.pad_token_id,
                             self.init_generation_config,
                         )
                     else:
-                        # Stage II: 批次级混合采样（论文 Section 5.3）
-                        # 按概率决定整个 batch 使用 ref_policy 或当前策略
-                        # 优点：工程实现简单稳健，避免复杂的 tensor 拼接和 padding 问题
-                        # 注意：相比样本级混合，方差稍大，但在大量训练步后期望值收敛一致
-                        use_offline_batch = torch.rand(1, device=device).item() < args.offline_y1_ratio
-                        model_to_use = self.ref_policy if use_offline_batch else unwrapped_model
+                        # Stage II: 样本级混合采样（论文 Section 5.3）
+                        # 对每个样本独立决定使用 ref_policy 或当前策略
+                        # 这样确保梯度更新的稳定性
+                        batch_size = queries.shape[0]
+                        use_offline_mask = torch.rand(batch_size, device=device) < args.offline_y1_ratio
                         
-                        init_outputs, _ = batch_generation(
-                            model_to_use,
-                            queries,
-                            args.local_rollout_forward_batch_size,
-                            self.processing_class.pad_token_id,
-                            self.init_generation_config,
+                        # 分别对两组样本生成
+                        offline_indices = torch.where(use_offline_mask)[0]
+                        online_indices = torch.where(~use_offline_mask)[0]
+                        
+                        init_outputs = torch.zeros(
+                            batch_size, queries.shape[1] + self.init_generation_config.max_new_tokens,
+                            dtype=torch.long, device=device
                         )
+                        
+                        if len(offline_indices) > 0:
+                            offline_queries = queries[offline_indices]
+                            offline_outputs, _ = batch_generation(
+                                self.ref_policy,
+                                offline_queries,
+                                args.local_rollout_forward_batch_size,
+                                self.processing_class.pad_token_id,
+                                self.init_generation_config,
+                            )
+                            init_outputs[offline_indices] = offline_outputs
+                        
+                        if len(online_indices) > 0:
+                            online_queries = queries[online_indices]
+                            online_outputs, _ = batch_generation(
+                                unwrapped_model,
+                                online_queries,
+                                args.local_rollout_forward_batch_size,
+                                self.processing_class.pad_token_id,
+                                self.init_generation_config,
+                            )
+                            init_outputs[online_indices] = online_outputs
 
                     init_context_len = queries.shape[1]
                     init_answers = init_outputs[:, init_context_len:]
@@ -429,133 +478,137 @@ class SCoRETrainer(Trainer):
                 mb_init_context_len = mb_queries.shape[1]
 
                 # ========== 计算当前策略的 log prob (需要梯度) ==========
-                # 注意：Stage I 和 Stage II 都需要计算 y1 的 logprob！
-                # - Stage I: y1 的 logprob 用于 KL 约束（有梯度，但不做 PG）
+                # Stage I 和 Stage II 都需要计算 y1 和 y2 的 logprob
+                # 区别：
+                # - Stage I: y1 的 logprob 仅用于 KL 约束，不做 PG
                 # - Stage II: y1 的 logprob 用于 KL 约束 + PG
                 
-                # y1 的 log prob（必须带梯度！）
+                # y1 的 log prob（Stage I/II 都需要，用于 KL 约束）
                 out_init = forward(self.model, mb_init_outputs, self.processing_class.pad_token_id)
                 logits_init = out_init.logits[:, mb_init_context_len - 1 : -1]
-                # logits_init /= args.temperature + 1e-7
                 logprob_init = selective_log_softmax(logits_init, mb_init_tokens)
                 logprob_init = logprob_init.masked_fill_(mb_mask_init, 0)
                 
-                # y2 的 log prob
+                # y2 的 log prob（Stage I/II 都需要）
                 out_corr = forward(self.model, mb_corr_outputs, self.processing_class.pad_token_id)
                 logits_corr = out_corr.logits[:, corr_context_len - 1 : -1]
-                # logits_corr /= args.temperature + 1e-7
                 logprob_corr = selective_log_softmax(logits_corr, mb_corr_tokens)
                 logprob_corr = logprob_corr.masked_fill_(mb_mask_corr, 0)
 
                 # ========== 计算 Policy Gradient Loss ==========
                 sum_lp_corr = logprob_corr.sum(dim=1)
-                sum_lp_init = logprob_init.sum(dim=1)
 
                 if args.stage == 1:
-                    # Stage I: y1 来自离线 buffer（ref policy），y2 为在线采样纠错
-
                     # ============================================================
-                    # 1. Policy Gradient (针对 y2 的纠错能力优化)
+                    # Stage I: 初始化阶段（论文 Section 4.1 + 5.1）
                     # ============================================================
-                    # 目标：最大化 y2 的 Reward
+                    # 完整目标: max E[r(y2)] - β1·D_KL(π_θ(y1|x) || π_ref(y1|x)) 
+                    #                          - β2·D_KL(π_θ(y2|x,y1) || π_ref(y2|x,y1))
+                    # 
+                    # 关键点：
+                    # 1. y1 来自 ref_policy（离线数据），不做 Policy Gradient
+                    # 2. 但需要 KL 约束，确保模型在生成 y1 时保持接近 base model
+                    # 3. y2 做 Policy Gradient + KL 约束，学习纠错能力
+                    # 4. 双重 KL 约束防止模型崩溃到"直接解决方案"
+                    # ============================================================
+                    
                     with torch.no_grad():
                         baseline_corr = mb_reward_corr.mean()
                         advantage_corr = (mb_reward_corr - baseline_corr)
-                        # Advantage 归一化 (训练稳定的关键)
-                        advantage_corr = (advantage_corr - advantage_corr.mean()) / (advantage_corr.std() + 1e-8)
 
-                    # PG Loss: Minimize -(Advantage * log_prob)
+                    # Policy Gradient: 只优化 y2
+                    sum_lp_corr = logprob_corr.sum(dim=1)
                     loss_pg_corr = -(advantage_corr * sum_lp_corr).mean()
 
-                    # ============================================================
-                    # 2. KL 正则化 (关键分歧点修正)
-                    # ============================================================
-                    kl_init_per_token = (logprob_init - mb_ref_init_logprob) 
-
-                    # --- [关键点 B] y2 部分 (Online / Sampled Data) ---
-                    # 数据性质：y2 是当前模型实时采样生成的
-                    # 目标：限制探索范围，防止 Reward Hacking (PPO Trust Region)
-                    # 数学原理：Minimize Reverse KL (Model || Ref)
-                    # 实现公式：(Model - Ref)
-                    # 解析：当 model 对某 token 盲目自信(概率远超 Ref)时，Diff 变大，Loss 变大 -> 惩罚偏离
-                    # kl_corr_per_token = (logprob_corr - mb_ref_corr_logprob)
-
-                    # ============================================================
-                    # 3. Mask 处理与长度归一化
-                    # ============================================================
-                    # 假设 mb_mask 为 True 代表 Padding
+                    # KL 正则化: 约束 y1 和 y2
                     valid_mask_init = (~mb_mask_init).float()
-                    # valid_mask_corr = (~mb_mask_corr).float()
-
-                    # 应用 Mask (只计算非 Pad 部分)
-                    kl_init_per_token = kl_init_per_token * valid_mask_init
-                    # kl_corr_per_token = kl_corr_per_token * valid_mask_corr
-
-                    # 计算有效长度 (防止除零)
+                    valid_mask_corr = (~mb_mask_corr).float()
+                    
+                    # y1 的 KL: 确保模型生成 y1 时接近 base model
+                    kl_init_per_token = (logprob_init - mb_ref_init_logprob) * valid_mask_init
                     len_init = valid_mask_init.sum(dim=1).clamp(min=1.0)
-                    # len_corr = valid_mask_corr.sum(dim=1).clamp(min=1.0)
-
-                    # 计算样本级平均 KL
                     kl_init_per_sample = kl_init_per_token.sum(dim=1) / len_init
-                    # kl_corr_per_sample = kl_corr_per_token.sum(dim=1) / len_corr
-
-                    # ============================================================
-                    # 4. 数值稳定性 (Clamp)
-                    # ============================================================
-                    # 截断负值：
-                    # 1. 对于 y1: 如果 Model 比 Ref 更自信 (Ref-Model < 0)，Loss=0 (不惩罚“学得好”)
-                    # 2. 对于 y2: 如果 Model 比 Ref 更不自信 (Model-Ref < 0)，Loss=0 (允许不自信)
                     kl_init_per_sample = torch.clamp(kl_init_per_sample, min=0.0)
-                    # kl_corr_per_sample = torch.clamp(kl_corr_per_sample, min=0.0)
-
-                    # ============================================================
-                    # 5. 总 Loss 计算
-                    # ============================================================
                     loss_kl_init = args.init_kl_coef * kl_init_per_sample.mean()
-                    # loss_kl_corr = args.init_kl_coef * kl_corr_per_sample.mean()
+                    
+                    # y2 的 KL: 确保纠错时不过度偏离
+                    kl_corr_per_token = (logprob_corr - mb_ref_corr_logprob) * valid_mask_corr
+                    len_corr = valid_mask_corr.sum(dim=1).clamp(min=1.0)
+                    kl_corr_per_sample = kl_corr_per_token.sum(dim=1) / len_corr
+                    kl_corr_per_sample = torch.clamp(kl_corr_per_sample, min=0.0)
+                    loss_kl_corr = args.corr_kl_coef * kl_corr_per_sample.mean()
 
-                    loss = loss_pg_corr + loss_kl_init 
-
-                    # ============================================================
-                    # 6. 日志记录
-                    # ============================================================
+                    # Stage I 总损失: PG(y2) + KL(y1) + KL(y2)
+                    loss = loss_pg_corr + loss_kl_init + loss_kl_corr
+                    
+                    # 日志记录
                     total_kl_init += kl_init_per_sample.detach().mean().item()
-                    # total_kl_corr += kl_corr_per_sample.detach().mean().item()
+                    total_kl_corr += kl_corr_per_sample.detach().mean().item()
 
                 else:
-                    # Stage II: 同时优化 y1 和 y2
-                    # 论文公式: max E[Σ r̂(yi, y*)] - β1·Σ D_KL(π_θ(·|xi) || π_ref(·|xi))
-                    # 其中 r̂(y1, y*) = r(y1, y*)
-                    #      r̂(y2, y*) = r(y2, y*) + α·[r(y2, y*) - r(y1, y*)] (reward bonus)
+                    # ============================================================
+                    # Stage II: 联合优化阶段（论文 Section 4.2）
+                    # ============================================================
+                    # 论文公式: max E[r(y1) + r̃(y2)] - β·(KL_1 + KL_2)
+                    # 其中 r̃(y2) = r(y2) + α·(r(y2) - r(y1))
+                    # 
+                    # 关键理解：
+                    # "联合优化"是指整体目标函数包含两项奖励
+                    # 但 REINFORCE 梯度应该分离：
+                    # - y1 的梯度由 r(y1) 驱动
+                    # - y2 的梯度由 r̃(y2) 驱动
+                    # ============================================================
+                    sum_lp_init = logprob_init.sum(dim=1)
+                    
+                    # 计算 y2 的增强奖励（带 reward bonus）
                     r2_tilde = mb_reward_corr + args.stage2_alpha * (mb_reward_corr - mb_reward_init)
-
-                    # 使用原有的按 token 求和 KL 形式（Stage II 保持旧策略）
-                    kl_init_per_sample = (logprob_init - mb_ref_init_logprob).sum(dim=1)
-                    # kl_corr_per_sample = (logprob_corr - mb_ref_corr_logprob).sum(dim=1)
                     
                     with torch.no_grad():
-                        baseline_init = mb_reward_init.mean()
-                        baseline_corr = r2_tilde.mean()
-                        advantage_init = mb_reward_init - baseline_init
-                        advantage_corr = r2_tilde - baseline_corr
+                        # 使用整个 local batch 计算 baseline（减少方差）
+                        baseline_init = reward_init.mean()
+                        
+                        all_r2_tilde = reward_corr + args.stage2_alpha * (reward_corr - reward_init)
+                        baseline_corr = all_r2_tilde.mean()
+                        
+                        # 分离的 advantage
+                        advantage_init = mb_reward_init - baseline_init  # y1 优化自身准确率
+                        advantage_corr = r2_tilde - baseline_corr        # y2 优化纠错+bonus
                     
-                    # Policy gradient for y1: max E[r(y1)]
+                    # Policy Gradient: 分离优化
+                    # y1: 最大化首轮准确率
                     loss_pg_init = -(advantage_init * sum_lp_init).mean()
-                    # Policy gradient for y2: max E[r̂(y2)] where r̂(y2) includes reward bonus
+                    # y2: 最大化纠错准确率 + 纠错增益奖励
                     loss_pg_corr = -(advantage_corr * sum_lp_corr).mean()
                     
-                    # KL 正则化: β1 * [D_KL(π_θ(·|x) || π_ref(·|x)) + D_KL(π_θ(·|x1) || π_ref(·|x1))]
-                    # 论文使用统一的 β1 对两个 KL 项进行约束
-                    loss_kl_init = args.init_kl_coef * kl_init_per_sample.mean()
-                    # loss_kl_corr = args.init_kl_coef * kl_corr_per_sample.mean()
-                    # loss_kl = loss_kl_init + loss_kl_corr
+                    # KL 正则化（长度归一化版本，与 Stage I 保持一致）
+                    valid_mask_init = (~mb_mask_init).float()
+                    valid_mask_corr = (~mb_mask_corr).float()
                     
-                    loss = loss_pg_init + loss_pg_corr + loss_kl_init
+                    kl_init_per_token = (logprob_init - mb_ref_init_logprob) * valid_mask_init
+                    kl_corr_per_token = (logprob_corr - mb_ref_corr_logprob) * valid_mask_corr
+                    
+                    len_init = valid_mask_init.sum(dim=1).clamp(min=1.0)
+                    len_corr = valid_mask_corr.sum(dim=1).clamp(min=1.0)
+                    
+                    kl_init_per_sample = kl_init_per_token.sum(dim=1) / len_init
+                    kl_corr_per_sample = kl_corr_per_token.sum(dim=1) / len_corr
+                    
+                    kl_init_per_sample = torch.clamp(kl_init_per_sample, min=0.0)
+                    kl_corr_per_sample = torch.clamp(kl_corr_per_sample, min=0.0)
+                    
+                    # KL 损失: β·(KL_1 + KL_2)
+                    loss_kl_init = args.init_kl_coef * kl_init_per_sample.mean()
+                    loss_kl_corr = args.corr_kl_coef * kl_corr_per_sample.mean()
+                    loss_kl = loss_kl_init + loss_kl_corr
+                    
+                    # 总损失: 论文公式的负数形式
+                    # -max E[r(y1) + r̃(y2)] + β·(KL_1 + KL_2)
+                    # = min -E[r(y1)] - E[r̃(y2)] + β·(KL_1 + KL_2)
+                    loss = loss_pg_init + loss_pg_corr + loss_kl
                     
                     # 记录用于日志
                     total_kl_init += kl_init_per_sample.detach().mean().item()
-                    # total_kl_corr += kl_corr_per_sample.detach().mean().item()
-
+                    total_kl_corr += kl_corr_per_sample.detach().mean().item()
                 loss = loss / self.algo_config['gradient_accumulation_steps']
                 total_loss += loss.item()
 
@@ -563,7 +616,7 @@ class SCoRETrainer(Trainer):
                 micro_step += 1
 
                 if micro_step == self.algo_config['gradient_accumulation_steps']:
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
                     self.optimizer.step()
                     self.lr_scheduler.step()
                     self.optimizer.zero_grad()
@@ -575,6 +628,18 @@ class SCoRETrainer(Trainer):
             with torch.no_grad():
                 mean_reward_corr = accelerator.gather_for_metrics(reward_corr).mean().item()
                 mean_reward_init = accelerator.gather_for_metrics(reward_init).mean().item()
+                mean_reward_delta = mean_reward_corr - mean_reward_init
+                if 'reward_corr' not in ema_stats:
+                    ema_stats['reward_corr'] = mean_reward_corr
+                    ema_stats['reward_delta'] = mean_reward_delta
+                    ema_stats['kl_corr'] = total_kl_corr / max(1, args.local_batch_size // args.per_device_train_batch_size)
+                else:
+                    # 只有当字典里已经有值了，才进行平滑更新
+                    curr_kl = total_kl_corr / max(1, args.local_batch_size // args.per_device_train_batch_size)
+                    ema_stats['reward_corr'] = (1 - ema_alpha) * ema_stats['reward_corr'] + ema_alpha * mean_reward_corr
+                    ema_stats['reward_delta'] = (1 - ema_alpha) * ema_stats['reward_delta'] + ema_alpha * mean_reward_delta
+                    ema_stats['kl_corr'] = (1 - ema_alpha) * ema_stats['kl_corr'] + ema_alpha * curr_kl
+
                 metrics = {}
                 metrics["score/kl_init"] = total_kl_init / max(1, args.local_batch_size // args.per_device_train_batch_size)
                 metrics["score/kl_corr"] = total_kl_corr / max(1, args.local_batch_size // args.per_device_train_batch_size)
@@ -584,6 +649,9 @@ class SCoRETrainer(Trainer):
                 metrics["loss"] = total_loss
                 metrics["episode"] = self.state.episode
                 metrics["step"] = step_idx
+                metrics["score_ema/reward_corr"] = ema_stats['reward_corr']
+                metrics["score_ema/reward_delta"] = ema_stats['reward_delta']
+                metrics["score_ema/kl_corr"] = ema_stats['kl_corr']
                 self.log(metrics)
 
             del corr_outputs, corr_tokens, init_outputs, init_answers, queries
@@ -598,11 +666,11 @@ class SCoRETrainer(Trainer):
                 self._save_checkpoint(self.model, trial=None)
                 self.control = self.callback_handler.on_save(self.args, self.state, self.control)
 
-            if (
-                args.num_sample_generations > 0
-                and (step_idx - 1) % max(1, args.num_total_batches // args.num_sample_generations) == 0
-            ):
-                self.generate_completions(sampling=True)
+            # if (
+            #     args.num_sample_generations > 0
+            #     and (step_idx - 1) % max(1, args.num_total_batches // args.num_sample_generations) == 0
+            # ):
+            #     self.generate_completions(sampling=True)
 
             # Early termination if needed
             if self.control.should_training_stop:
