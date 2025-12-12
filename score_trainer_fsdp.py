@@ -324,6 +324,10 @@ class SCoRETrainer(Trainer):
         ema_stats = {} 
         ema_alpha = 0.05  # 平滑系数
 
+        self.processing_class.padding_side = "left"
+        if self.processing_class.pad_token_id is None:
+            self.processing_class.pad_token_id = self.processing_class.eos_token_id
+
         for step_idx in range(1, args.num_total_batches + 1):
             data = next(iter_dataloader)
             self.state.episode += args.batch_size
@@ -360,11 +364,9 @@ class SCoRETrainer(Trainer):
                         offline_indices = torch.where(use_offline_mask)[0]
                         online_indices = torch.where(~use_offline_mask)[0]
                         
-                        init_outputs = torch.zeros(
-                            batch_size, queries.shape[1] + self.init_generation_config.max_new_tokens,
-                            dtype=torch.long, device=device
-                        )
-                        
+                        outputs_list = []
+                        indices_list = []
+
                         if len(offline_indices) > 0:
                             offline_queries = queries[offline_indices]
                             offline_outputs, _ = batch_generation(
@@ -374,7 +376,8 @@ class SCoRETrainer(Trainer):
                                 self.processing_class.pad_token_id,
                                 self.init_generation_config,
                             )
-                            init_outputs[offline_indices] = offline_outputs
+                            outputs_list.append(offline_outputs)
+                            indices_list.append(offline_indices)
                         
                         if len(online_indices) > 0:
                             online_queries = queries[online_indices]
@@ -385,7 +388,24 @@ class SCoRETrainer(Trainer):
                                 self.processing_class.pad_token_id,
                                 self.init_generation_config,
                             )
-                            init_outputs[online_indices] = online_outputs
+                            outputs_list.append(online_outputs)
+                            indices_list.append(online_indices)
+                        
+                        # Pad to same length before concatenation
+                        if len(outputs_list) > 1:
+                            max_len = max(x.shape[1] for x in outputs_list)
+                            for i in range(len(outputs_list)):
+                                if outputs_list[i].shape[1] < max_len:
+                                    outputs_list[i] = torch.nn.functional.pad(
+                                        outputs_list[i], 
+                                        (0, max_len - outputs_list[i].shape[1]), 
+                                        value=self.processing_class.pad_token_id
+                                    )
+                        
+                        init_outputs = torch.cat(outputs_list, dim=0)
+                        combined_indices = torch.cat(indices_list, dim=0)
+                        sort_order = torch.argsort(combined_indices)
+                        init_outputs = init_outputs[sort_order]
 
                     init_context_len = queries.shape[1]
                     init_answers = init_outputs[:, init_context_len:]
@@ -513,7 +533,7 @@ class SCoRETrainer(Trainer):
                     # ============================================================
                     
                     with torch.no_grad():
-                        baseline_corr = mb_reward_corr.mean()
+                        baseline_corr = reward_corr.mean()
                         advantage_corr = (mb_reward_corr - baseline_corr)
 
                     # Policy Gradient: 只优化 y2
