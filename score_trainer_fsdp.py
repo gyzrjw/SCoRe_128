@@ -1,16 +1,24 @@
+# score_trainer_fsdp.py
+# Latest patched SCoRETrainer with EMA Baseline
+# - Stage I: SFT on y1 (maximize log likelihood) + PG on y2
+# - Stage II: PG on y1 and y2 with weak KL constraints
+# - EMA baseline for small batch sizes
+# - Memory-friendly chunked ref forward, deepspeed/fsdp support
+
 import gc
 import math
 import os
 import time
-from collections import defaultdict
+from copy import deepcopy
+from dataclasses import dataclass, field
 from typing import Callable, Optional, Union
 
 import numpy as np
-import pandas as pd
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from accelerate import Accelerator
-from accelerate.utils import broadcast, gather_object
+from accelerate.utils import broadcast
 from datasets import Dataset
 from torch.utils.data import DataLoader
 from transformers import (
@@ -23,62 +31,72 @@ from transformers import (
     Trainer,
     TrainerCallback,
     TrainerControl,
-    get_cosine_schedule_with_warmup
+    get_cosine_schedule_with_warmup,
 )
 from transformers.integrations import get_reporting_integration_callbacks
 from transformers.trainer import DEFAULT_CALLBACKS, DEFAULT_PROGRESS_CALLBACK
 from transformers.trainer_callback import CallbackHandler, ExportableState, PrinterCallback
 
-# Assume these come from TRL’s code (as in RLOOTrainer):
+# trl utilities
 from trl.models.utils import unwrap_model_for_generation
 from trl.trainer.utils import (
     OnlineTrainerState,
     batch_generation,
     disable_dropout_in_model,
-    exact_div,
-    first_true_indices,
     forward,
-    get_reward,
     prepare_deepspeed,
-    print_rich_table,
     selective_log_softmax,
-    truncate_response,
+    generate_model_card,
+    get_comet_experiment_url,
 )
-from trl.trainer.rloo_config import RLOOConfig  # or create a new SCoREConfig
-from trl.trainer.utils import generate_model_card, get_comet_experiment_url, log_table_to_comet_experiment
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from copy import deepcopy
-
-
-
-# TODO: Add Scheduler, add validation
+from trl.trainer.rloo_config import RLOOConfig
 
 INVALID_LOGPROB = 1.0
 
+@dataclass
+class SCoREConfig(RLOOConfig):
+    """
+    Extended config for SCoRE (inherits RLOOConfig).
+    - beta2_kl: SFT coefficient for y1 in Stage I (maximize log likelihood).
+    - beta1_kl: weak KL coefficient applied in Stage II to both y1 and y2.
+    - ema_alpha: smoothing factor for EMA baseline (default 0.05).
+    """
+    stage: int = field(default=1, metadata={"help": "Stage of SCoRE Training (1 or 2)"})
+    beta2_kl: float = field(default=0.1, metadata={"help": "β₂: SFT coefficient on y1 (Stage I)"})
+    beta1_kl: float = field(default=0.01, metadata={"help": "β₁: weak KL applied in Stage II to y1 and y2"})
+    stage2_alpha: float = field(default=0.5, metadata={"help": "α for r2_tilde = r2 + α (r2 - r1)"})
+    ema_alpha: float = field(default=0.05, metadata={"help": "EMA smoothing factor for baseline"})
+    eval_reward_threshold: float = field(default=0.5, metadata={"help": "threshold for eval correctness if eval used"})
+    max_eval_batches: int = field(default=64, metadata={"help": "max eval batches for light eval if called"})
+
+
+def compute_kl_robust(logprob: torch.Tensor, ref_logprob: torch.Tensor, mask: torch.Tensor):
+    """
+    Robust KL estimate per-sample:
+      - mask: boolean mask where True indicates padding token
+      - token-wise diff -> clip -> per-sample mean -> diagnostics -> softplus for non-negativity
+    Returns:
+      kl_final: tensor [B] (non-negative)
+      percent_negative: float (fraction of samples with raw mean < 0)
+      mean_raw_kl: float (mean of raw per-sample means)
+    """
+    CLIP = 20.0
+    valid_mask = (~mask).float()  # 1 for valid tokens
+    kl_per_token = torch.clamp(logprob - ref_logprob, min=-CLIP, max=CLIP) * valid_mask
+    seq_len = valid_mask.sum(dim=1).clamp(min=1.0)
+    mean_raw = kl_per_token.sum(dim=1) / seq_len
+    percent_negative = (mean_raw < 0).float().mean().item()
+    mean_raw_kl = mean_raw.mean().item()
+    kl_final = F.softplus(mean_raw)
+    return kl_final, percent_negative, mean_raw_kl
+
+
 class SCoRETrainer(Trainer):
-    """
-    A single-stage SCoRE algorithm implemented in the style of TRL's RLOOTrainer.
-
-    先生成 initial answer (y1) — 并计算与 ref policy 的 KL 约束
-    再生成 correction (y2) — 计算 reward (r2)
-    最终目标：R = r2 - beta * KL(y1)（Stage 1） 或 Stage 2 的更复杂配方
-    使用 REINFORCE (policy gradient) 对 y2 的 token log-prob 做梯度更新（并在 Stage2 中同时更新 y1）
-
-    Key differences from standard PPO/POLICY GRAD approaches:
-      - We generate an INITIAL answer (which gets a KL penalty vs. ref policy).
-      - Then we generate a CORRECTION from the policy, which gets a reward from
-        the reward/cost function.
-      - Final scalar = Reward(correction) - beta * KL(initial).
-      - Use REINFORCE on the correction tokens to update the policy.
-
-    Everything else (Accelerator, logging, etc.) is kept consistent
-    with the RLOOTrainer style.
-    """
-    _tag_names = ["trl", "score"]  # for optional tracking in your model config
+    _tag_names = ["trl", "score"]
 
     def __init__(
         self,
-        config: RLOOConfig,
+        config: SCoREConfig,
         algo_config,
         processing_class: Optional[
             Union[PreTrainedTokenizerBase, BaseImageProcessor, FeatureExtractionMixin, ProcessorMixin]
@@ -93,23 +111,16 @@ class SCoRETrainer(Trainer):
         optimizers: tuple[torch.optim.Optimizer, torch.optim.lr_scheduler._LRScheduler] = (None, None),
         callbacks: Optional[list[TrainerCallback]] = None,
     ) -> None:
-        """
-        Very similar to RLOOTrainer.__init__, except we note that we only do single-step REINFORCE
-        logic inside the train loop.
-        """
-        #保证ref_policy与 policy 不是同一对象
-        if ref_policy is policy:    
-            raise ValueError(
-                "`policy` and `ref_policy` cannot be the same object. If you want `ref_policy` to be the "
-                "same as `policy`, pass a *copy* or pass `None` if using PEFT's read-only approach."
-            )
+        # ensure ref_policy and policy are different objects
+        if ref_policy is policy:
+            raise ValueError("`policy` and `ref_policy` cannot be the same object.")
 
-        # 显式冻结 ref_policy 的所有参数，确保不会被更新
+        # freeze ref_policy
         for param in ref_policy.parameters():
             param.requires_grad = False
-        ref_policy.eval()  # 设置为评估模式
+        ref_policy.eval()
 
-        self.args = config  # For TRL, a config derived from RLOOConfig or similar
+        self.args = config
         args = config
         self.algo_config = algo_config
         self.processing_class = processing_class
@@ -119,74 +130,75 @@ class SCoRETrainer(Trainer):
         self.train_dataset = train_dataset
         self.eval_dataset = eval_dataset
         self.optimizer, self.lr_scheduler = optimizers
-        self.optimizer_cls_and_kwargs = None  # used by HF Trainer if re-creating optimizers
         self.prompt_builder = prompt_builder
 
-        
-        # 如果 data_collator 未给定，则基于 tokenizer 创建默认 collator；
-        # collator 用于数据打包（padding/attention mask）
         if data_collator is None:
             data_collator = DataCollatorWithPadding(self.processing_class)
         self.data_collator = data_collator
 
-        # 禁用 dropout
+        # disable dropout
         for module in [policy, ref_policy, reward_model]:
             if isinstance(module, nn.Module):
                 disable_dropout_in_model(module)
 
-        # GenerationConfig 设置（initial / correction）
-        # 两者通常相同，可根据需要调整
+        # token ids
+        pad_id = getattr(self.processing_class, "pad_token_id", None)
+        eos_id = getattr(self.processing_class, "eos_token_id", None)
+        if pad_id is None:
+            pad_id = getattr(self.processing_class, "eos_token_id", None)
+        if eos_id is None:
+            eos_id = getattr(self.processing_class, "eos_token_id", None)
+
         self.init_generation_config = GenerationConfig(
-            max_new_tokens=args.response_length,  # or some separate param, e.g. args.initial_answer_length
+            max_new_tokens=args.response_length,
             temperature=args.temperature,
-            #top_k=0,
             top_p=0.8,
             do_sample=True,
-            pad_token_id=None,
-            eos_token_id=None,
+            pad_token_id=pad_id,
+            eos_token_id=eos_id,
         )
         self.corr_generation_config = GenerationConfig(
-            max_new_tokens=args.response_length,  # or separate param, e.g. correction_length
+            max_new_tokens=args.response_length,
             temperature=args.temperature,
-            #top_k=0,
             top_p=0.8,
             do_sample=True,
-            pad_token_id=None,
-            eos_token_id=None,
+            pad_token_id=pad_id,
+            eos_token_id=eos_id,
         )
 
-        # Construct the dataloader
+        # dataset length & episodes
         self.train_dataset_len = len(train_dataset)
-        if args.total_episodes is None:  # allow user to define episodes in terms of epochs
+        if args.total_episodes is None:
             args.total_episodes = int(args.num_train_epochs * self.train_dataset_len)
 
-        # Build accelerator
+        # Accelerator
         accelerator = Accelerator()
         self.accelerator = accelerator
-        self.accelerator.state.deepspeed_plugin.deepspeed_config['gradient_accumulation_steps'] = self.algo_config['gradient_accumulation_steps']
+
+        # ensure gradient_accumulation_steps present
+        self.algo_config['gradient_accumulation_steps'] = self.algo_config.get('gradient_accumulation_steps', 1)
+        try:
+            accelerator.state.deepspeed_plugin.deepspeed_config['gradient_accumulation_steps'] = self.algo_config['gradient_accumulation_steps']
+        except Exception:
+            pass
+
         args.world_size = accelerator.num_processes
 
-        # This part is from RLOO: computing local_batch_size, micro_batch_size, etc.
-        args.local_batch_size = (
-            args.per_device_train_batch_size
-            * args.gradient_accumulation_steps
-        )
+        # Batch size computations
+        args.local_batch_size = args.per_device_train_batch_size * args.gradient_accumulation_steps
         args.micro_batch_size = int(args.per_device_train_batch_size * args.world_size)
         args.batch_size = int(args.local_batch_size * args.world_size)
-        # we do not do multiple mini-batches in this example, so skip that part
-
-        # total number of train steps
         args.num_total_batches = math.ceil(args.total_episodes / args.batch_size)
-        # name runs etc.
+
+        # run name + seed
         time_tensor = torch.tensor(int(time.time()), device=accelerator.device)
         time_int = broadcast(time_tensor, 0).item()
         args.run_name = f"{args.exp_name}"
 
-        # Seeds, directories, etc.
         self.local_seed = args.seed
         torch.manual_seed(args.seed)
 
-        # Prepare data loader
+        # DataLoader
         self.dataloader = DataLoader(
             self.train_dataset,
             batch_size=args.local_batch_size,
@@ -194,15 +206,24 @@ class SCoRETrainer(Trainer):
             collate_fn=self.data_collator,
             drop_last=True,
         )
-        self.model = policy  # HF Trainer expects self.model
-        self.model, self.optimizer, self.dataloader = accelerator.prepare(self.model, self.optimizer, self.dataloader)
-        self.lr_scheduler = get_cosine_schedule_with_warmup(self.optimizer, num_warmup_steps=self.algo_config['num_warmup_steps'], num_training_steps=args.num_total_batches)
 
+        # prepare model/optimizer/dataloader with Accelerator
+        self.model = policy
+        self.model, self.optimizer, self.dataloader = accelerator.prepare(
+            self.model, self.optimizer, self.dataloader
+        )
 
-        # reset local seed
+        # scheduler
+        self.lr_scheduler = get_cosine_schedule_with_warmup(
+            self.optimizer,
+            num_warmup_steps=self.algo_config.get('num_warmup_steps', 0),
+            num_training_steps=args.num_total_batches
+        )
+
+        # reset seed
         torch.manual_seed(self.local_seed)
 
-        # Prepare eval dataloader if needed
+        # eval dataloader optional
         if self.eval_dataset is not None:
             self.eval_dataloader = DataLoader(
                 self.eval_dataset,
@@ -214,9 +235,10 @@ class SCoRETrainer(Trainer):
         else:
             self.eval_dataloader = None
 
-        # If using DeepSpeed / FSDP
+        # DeepSpeed / FSDP handling
         self.is_deepspeed_enabled = getattr(self.accelerator.state, "deepspeed_plugin", None) is not None
         self.is_fsdp_enabled = getattr(self.accelerator.state, "fsdp_plugin", None) is not None
+
         if self.is_deepspeed_enabled:
             if isinstance(self.reward_model, nn.Module):
                 self.reward_model = prepare_deepspeed(
@@ -231,11 +253,11 @@ class SCoRETrainer(Trainer):
             if isinstance(self.reward_model, nn.Module):
                 self.reward_model = self.reward_model.to(self.accelerator.device)
 
-        # Create optimizer if not passed in
+        # create optimizer if not provided
         if self.optimizer is None:
             self.create_optimizer_and_scheduler(num_training_steps=args.num_total_batches)
 
-        # Setup HF Trainer state + callbacks
+        # callbacks
         default_callbacks = DEFAULT_CALLBACKS + get_reporting_integration_callbacks(self.args.report_to)
         self.callbacks = default_callbacks if callbacks is None else default_callbacks + callbacks
         self.callback_handler = CallbackHandler(
@@ -243,53 +265,183 @@ class SCoRETrainer(Trainer):
         )
         self.add_callback(PrinterCallback if self.args.disable_tqdm else DEFAULT_PROGRESS_CALLBACK)
 
-
+        # trainer state
         self.control = TrainerControl()
         self.state = OnlineTrainerState(
             is_local_process_zero=self.is_local_process_zero(),
             is_world_process_zero=self.is_world_process_zero(),
-            stateful_callbacks=[
-                cb for cb in self.callback_handler.callbacks + [self.control] if isinstance(cb, ExportableState)
-            ],
+            stateful_callbacks=[cb for cb in self.callback_handler.callbacks + [self.control] if isinstance(cb, ExportableState)],
             save_steps=args.save_steps
         )
         self.current_flos = 0
         self.hp_search_backend = None
 
-        # Create local dir, push to hub, etc.
+        # create output dir
         if self.args.push_to_hub:
             self.init_hf_repo()
         if self.args.should_save:
             os.makedirs(self.args.output_dir, exist_ok=True)
 
-        # Tag model if needed
+        # model tags
         if hasattr(self.model, "add_model_tags"):
             self.model.add_model_tags(self._tag_names)
 
+        # EMA baseline initialization
+        self.ema_baseline_init = None
+        self.ema_baseline_corr = None
+        self.ema_baseline_r2_tilde = None
+        self.ema_alpha = args.ema_alpha
+        
+        print(f"[INFO] Using EMA baseline with alpha={self.ema_alpha}")
+
+    def _batch_score_reward(self, outputs_texts, references):
+        """
+        Batch scoring wrapper for reward model.
+        """
+        device = self.accelerator.device
+        refs = list(references)
+        try:
+            if hasattr(self.reward_model, "batch_score"):
+                scores = self.reward_model.batch_score(outputs_texts, refs)
+                return torch.tensor(scores, dtype=torch.float, device=device)
+            if hasattr(self.reward_model, "score_batch"):
+                scores = self.reward_model.score_batch(outputs_texts, refs)
+                return torch.tensor(scores, dtype=torch.float, device=device)
+            scores = self.reward_model(outputs_texts, refs)
+            if isinstance(scores, torch.Tensor):
+                return scores.to(device).float()
+            return torch.tensor(list(scores), dtype=torch.float, device=device)
+        except Exception:
+            scores = []
+            for out, ref in zip(outputs_texts, refs):
+                scores.append(self.reward_model(model_answer=out, ground_truth=ref))
+            return torch.tensor(scores, dtype=torch.float, device=device)
+
+    def compute_ema_baseline(self, rewards: torch.Tensor, reward_type: str = "init") -> torch.Tensor:
+        """
+        Compute EMA baseline for given rewards.
+        Args:
+            rewards: tensor of shape [B]
+            reward_type: "init", "corr", or "r2_tilde"
+        Returns:
+            baseline tensor of shape [B] (all same value)
+        """
+        mean_reward = rewards.mean().item()
+        
+        if reward_type == "init":
+            if self.ema_baseline_init is None:
+                self.ema_baseline_init = mean_reward
+            else:
+                self.ema_baseline_init = (1 - self.ema_alpha) * self.ema_baseline_init + \
+                                         self.ema_alpha * mean_reward
+            return torch.full_like(rewards, self.ema_baseline_init)
+        
+        elif reward_type == "corr":
+            if self.ema_baseline_corr is None:
+                self.ema_baseline_corr = mean_reward
+            else:
+                self.ema_baseline_corr = (1 - self.ema_alpha) * self.ema_baseline_corr + \
+                                         self.ema_alpha * mean_reward
+            return torch.full_like(rewards, self.ema_baseline_corr)
+        
+        elif reward_type == "r2_tilde":
+            if self.ema_baseline_r2_tilde is None:
+                self.ema_baseline_r2_tilde = mean_reward
+            else:
+                self.ema_baseline_r2_tilde = (1 - self.ema_alpha) * self.ema_baseline_r2_tilde + \
+                                             self.ema_alpha * mean_reward
+            return torch.full_like(rewards, self.ema_baseline_r2_tilde)
+
+    @torch.no_grad()
+    def compute_eval_metrics(self, max_batches: int = 64, reward_threshold: float = 0.5):
+        """
+        Optional light-weight evaluation.
+        """
+        if self.eval_dataloader is None:
+            return {}
+
+        device = self.accelerator.device
+        self.model.eval()
+
+        n_seen = 0
+        init_correct_list = []
+        corr_correct_list = []
+        for batch_idx, batch in enumerate(self.eval_dataloader):
+            if batch_idx >= max_batches:
+                break
+            queries = batch["input_ids"].to(device).long()
+            with unwrap_model_for_generation(self.model, self.accelerator, gather_deepspeed3_params=getattr(self.args, "ds3_gather_for_generation", False)) as unwrapped_model:
+                init_outputs, _ = batch_generation(unwrapped_model, queries, self.args.local_rollout_forward_batch_size, self.processing_class.pad_token_id, self.init_generation_config)
+                init_context_len = queries.shape[1]
+                init_answers = init_outputs[:, init_context_len:]
+                init_texts = self.processing_class.batch_decode(init_answers, skip_special_tokens=True)
+
+                corr_inputs = build_correction_inputs_for_batch(batch, init_texts, self.processing_class, self.prompt_builder, question_col=self.algo_config['question_col']).to(device)
+                corr_outputs, _ = batch_generation(unwrapped_model, corr_inputs, self.args.local_rollout_forward_batch_size, self.processing_class.pad_token_id, self.corr_generation_config)
+                corr_context_len = corr_inputs.shape[1]
+                corr_tokens = corr_outputs[:, corr_context_len:]
+                corr_texts = self.processing_class.batch_decode(corr_tokens, skip_special_tokens=True)
+
+            scores_init = self._batch_score_reward(init_texts, batch[self.algo_config['gold_col']])
+            scores_corr = self._batch_score_reward(corr_texts, batch[self.algo_config['gold_col']])
+
+            init_correct = (scores_init >= reward_threshold).float().cpu().numpy()
+            corr_correct = (scores_corr >= reward_threshold).float().cpu().numpy()
+
+            init_correct_list.append(init_correct)
+            corr_correct_list.append(corr_correct)
+            n_seen += init_correct.shape[0]
+
+        if n_seen == 0:
+            self.model.train()
+            return {}
+
+        init_all = np.concatenate(init_correct_list, axis=0)
+        corr_all = np.concatenate(corr_correct_list, axis=0)
+        acc_t1 = float(init_all.mean())
+        acc_t2 = float(corr_all.mean())
+        delta_t = acc_t2 - acc_t1
+        delta_i_to_c = float(((init_all == 0) & (corr_all == 1)).sum() / len(init_all))
+        delta_c_to_i = float(((init_all == 1) & (corr_all == 0)).sum() / len(init_all))
+
+        metrics = {
+            "eval/accuracy_t1": acc_t1,
+            "eval/accuracy_t2": acc_t2,
+            "eval/delta_t1_t2": delta_t,
+            "eval/delta_i_to_c": delta_i_to_c,
+            "eval/delta_c_to_i": delta_c_to_i,
+            "eval/samples": int(len(init_all)),
+        }
+        self.model.train()
+        return metrics
+
     def train(self):
         """
-        Single-stage SCoRE training loop:
-          1) Generate initial answer (and compute KL vs. ref policy).
-          2) Generate correction (and get reward from reward_model).
-          3) Final reward = reward(correction) - beta * KL(initial).
-          4) REINFORCE update on the correction’s log-probs.
+        Memory-friendly SCoRE training loop with EMA baseline:
+         - Stage I: SFT on y1 (maximize log likelihood) + PG on y2 with EMA baseline
+         - Stage II: PG on y1 and y2 with weak KL constraints and EMA baseline
         """
         args = self.args
         accelerator = self.accelerator
         device = accelerator.device
         dataloader = self.dataloader
 
-        # internal trainer states
+        # sanity: local batch divisibility
+        assert args.local_batch_size % args.per_device_train_batch_size == 0, (
+            f"local_batch_size ({args.local_batch_size}) must be divisible by per_device_train_batch_size ({args.per_device_train_batch_size})."
+        )
+        num_micro_batches = args.local_batch_size // args.per_device_train_batch_size
+
+        # trainer state
         self.state.global_step = 0
         self.state.episode = 0
-        self.state.max_steps = args.num_total_batches  # or something else
-        self.state.num_train_epochs = args.num_train_epochs  # for logging
+        self.state.max_steps = args.num_total_batches
+        self.state.num_train_epochs = args.num_train_epochs
 
-        # Start
+        # callbacks begin
         self.control = self.callback_handler.on_train_begin(args, self.state, self.control)
         start_time = time.time()
 
-        # Reusable function to get next batch, infinitely
         def repeat_generator():
             while True:
                 yield from dataloader
@@ -297,197 +449,159 @@ class SCoRETrainer(Trainer):
         iter_dataloader = iter(repeat_generator())
         self.model.train()
 
-        # ================= [新增代码开始] =================
-        # 手动指定要恢复的 checkpoint 路径和步数
-        # resume_step = 300  # 你保存的 checkpoint 步数
-        # resume_path = "/root/autodl-tmp/data/math500/cache/SCoRE/score_stage2/checkpoint-300" # 请确认路径正确
-        
-        # if resume_step > 0:
-        #     print(f"🔥 Resuming training from step {resume_step}...")
-            
-        #     # 1. 加载 Policy 权重 (注意：只加载给 self.model，不要动 self.ref_policy)
-        #     # 你的代码使用了 Accelerator，所以最好通过 unwrap 加载，或者直接加载
-        #     # 这里假设保存的是 safetensors 或 bin，且是 LoRA 适配器
-        #     from peft import PeftModel
-        #     # 重新加载适配器权重
-        #     self.model.load_adapter(resume_path, adapter_name="default")
-            
-        #     # 2. 恢复状态变量
-        #     self.state.global_step = resume_step
-        #     self.state.episode = resume_step * args.batch_size
-            
-        #     # 注意：优化器状态(Optimizer State)在这里很难完美恢复，
-        #     # 因为你的代码是在 train 内部创建的 optimizer。
-        #     # 接受“学习率重新预热”通常是可以接受的。
-        # ================= [新增代码结束] =================
+        ema_stats = {}
+        ema_alpha = 0.05
 
-        ema_stats = {} 
-        ema_alpha = 0.05  # 平滑系数
-
+        # ensure tokenizer pad token set
         self.processing_class.padding_side = "left"
         if self.processing_class.pad_token_id is None:
             self.processing_class.pad_token_id = self.processing_class.eos_token_id
+        pad_id = self.processing_class.pad_token_id
 
+        # helper: slice logits to generation-aligned next-token logits
+        def logits_slice_for_generated(out_logits, outputs, context_len):
+            logits_nxt = out_logits[:, :-1, :]
+            gen_len = outputs.shape[1] - context_len
+            start = context_len - 1
+            end = start + gen_len
+            assert end <= logits_nxt.shape[1], f"end ({end}) > logits_nxt_len ({logits_nxt.shape[1]})"
+            return logits_nxt[:, start:end, :]
+
+        # helper: compute ref logprobs chunked
+        def compute_ref_logprobs_chunked(ref_model, all_outputs, context_len, chunk_size):
+            B, full_len = all_outputs.shape
+            gen_len = full_len - context_len
+            if gen_len <= 0:
+                return torch.zeros((B, 0), device=device), torch.zeros((B, 0), dtype=torch.bool, device=device)
+
+            ref_lp = torch.zeros((B, gen_len), dtype=torch.float, device=device)
+            mask = torch.zeros((B, gen_len), dtype=torch.bool, device=device)
+
+            for i in range(0, B, chunk_size):
+                j = min(i + chunk_size, B)
+                out_chunk = all_outputs[i:j]
+                with torch.no_grad():
+                    ref_out = forward(ref_model, out_chunk, pad_id)
+                    logits_ref = logits_slice_for_generated(ref_out.logits, out_chunk, context_len)
+                    y_tokens = out_chunk[:, context_len:]
+                    lp_chunk = selective_log_softmax(logits_ref, y_tokens)
+                    mask_chunk = (y_tokens == pad_id)
+                    lp_chunk = lp_chunk.masked_fill_(mask_chunk, 0.0)
+                    ref_lp[i:j] = lp_chunk
+                    mask[i:j] = mask_chunk
+                    del ref_out, logits_ref, lp_chunk, mask_chunk
+                    torch.cuda.empty_cache()
+            return ref_lp, mask
+
+        # main loop
         for step_idx in range(1, args.num_total_batches + 1):
             data = next(iter_dataloader)
             self.state.episode += args.batch_size
 
-            # ------------------------
-            # 1) Generate INITIAL and CORRECTION (采样策略按阶段区分)
-            # ------------------------
+            # --------------------------
+            # 1) Sampling y1 and y2 (no grad)
+            # --------------------------
             with torch.no_grad():
                 queries = data["input_ids"].to(device).long()
 
-                with unwrap_model_for_generation(
-                    self.model, accelerator, gather_deepspeed3_params=args.ds3_gather_for_generation
-                ) as unwrapped_model:
-                    
-                    # ======== 关键修复：采样策略按训练阶段区分 ========
+                with unwrap_model_for_generation(self.model, accelerator, gather_deepspeed3_params=getattr(args, "ds3_gather_for_generation", False)) as unwrapped_model:
+                    batch_size = queries.shape[0]
+
+                    # Stage I: y1 from ref_policy; Stage II: y1 from current model
                     if args.stage == 1:
-                        # Stage I: 100% 使用 ref_policy (base model)
-                        # 目标：学习如何纠正 base model 的次优答案
                         init_outputs, _ = batch_generation(
-                            self.ref_policy,  # ✓ 修复：Stage I 必须用 ref_policy
+                            self.ref_policy,
                             queries,
                             args.local_rollout_forward_batch_size,
-                            self.processing_class.pad_token_id,
+                            pad_id,
                             self.init_generation_config,
                         )
                     else:
-                        # Stage II: 样本级混合采样（论文 Section 5.3）
-                        # 对每个样本独立决定使用 ref_policy 或当前策略
-                        # 这样确保梯度更新的稳定性
-                        batch_size = queries.shape[0]
-                        use_offline_mask = torch.rand(batch_size, device=device) < args.offline_y1_ratio
-                        
-                        # 分别对两组样本生成
-                        offline_indices = torch.where(use_offline_mask)[0]
-                        online_indices = torch.where(~use_offline_mask)[0]
-                        
-                        outputs_list = []
-                        indices_list = []
-
-                        if len(offline_indices) > 0:
-                            offline_queries = queries[offline_indices]
-                            offline_outputs, _ = batch_generation(
-                                self.ref_policy,
-                                offline_queries,
-                                args.local_rollout_forward_batch_size,
-                                self.processing_class.pad_token_id,
-                                self.init_generation_config,
-                            )
-                            outputs_list.append(offline_outputs)
-                            indices_list.append(offline_indices)
-                        
-                        if len(online_indices) > 0:
-                            online_queries = queries[online_indices]
-                            online_outputs, _ = batch_generation(
-                                unwrapped_model,
-                                online_queries,
-                                args.local_rollout_forward_batch_size,
-                                self.processing_class.pad_token_id,
-                                self.init_generation_config,
-                            )
-                            outputs_list.append(online_outputs)
-                            indices_list.append(online_indices)
-                        
-                        # Pad to same length before concatenation
-                        if len(outputs_list) > 1:
-                            max_len = max(x.shape[1] for x in outputs_list)
-                            for i in range(len(outputs_list)):
-                                if outputs_list[i].shape[1] < max_len:
-                                    outputs_list[i] = torch.nn.functional.pad(
-                                        outputs_list[i], 
-                                        (0, max_len - outputs_list[i].shape[1]), 
-                                        value=self.processing_class.pad_token_id
-                                    )
-                        
-                        init_outputs = torch.cat(outputs_list, dim=0)
-                        combined_indices = torch.cat(indices_list, dim=0)
-                        sort_order = torch.argsort(combined_indices)
-                        init_outputs = init_outputs[sort_order]
+                        init_outputs, _ = batch_generation(
+                            unwrapped_model,
+                            queries,
+                            args.local_rollout_forward_batch_size,
+                            pad_id,
+                            self.init_generation_config,
+                        )
 
                     init_context_len = queries.shape[1]
                     init_answers = init_outputs[:, init_context_len:]
-
-                    # 生成 correction 的输入
                     init_answer_texts = self.processing_class.batch_decode(init_answers, skip_special_tokens=True)
+
+                    # build correction inputs
                     corr_inputs = build_correction_inputs_for_batch(
-                        data, 
+                        data,
                         init_answer_texts,
                         self.processing_class,
                         self.prompt_builder,
                         question_col=self.algo_config['question_col'],
                     ).to(device)
-                
-                    # y2 (correction) 始终从当前训练的策略采样
+
+                    # y2 always from current policy
                     corr_outputs, _ = batch_generation(
-                        unwrapped_model,  # Stage I/II 都从 self.model 采样 y2
+                        unwrapped_model,
                         corr_inputs,
                         args.local_rollout_forward_batch_size,
-                        self.processing_class.pad_token_id,
-                        self.init_generation_config,
+                        pad_id,
+                        self.corr_generation_config,
                     )
-                
                     corr_context_len = corr_inputs.shape[1]
                     corr_tokens = corr_outputs[:, corr_context_len:]
 
-                # 计算 reference policy 的 log prob (用于 KL，不需要梯度)
-                ref_init_out = forward(self.ref_policy, init_outputs, self.processing_class.pad_token_id)
-                ref_init_logits = ref_init_out.logits[:, init_context_len - 1 : -1]
-                # ref_init_logits /= args.temperature + 1e-7
-                ref_init_logprob = selective_log_softmax(ref_init_logits, init_answers)
-                mask_init = (init_answers == self.processing_class.pad_token_id)
-                ref_init_logprob = ref_init_logprob.masked_fill_(mask_init, 0)
-
-                ref_corr_out = forward(self.ref_policy, corr_outputs, self.processing_class.pad_token_id)
-                ref_corr_logits = ref_corr_out.logits[:, corr_context_len - 1 : -1]
-                # ref_corr_logits /= args.temperature + 1e-7
-                ref_corr_logprob = selective_log_softmax(ref_corr_logits, corr_tokens)
-                mask_corr = (corr_tokens == self.processing_class.pad_token_id)
-                ref_corr_logprob = ref_corr_logprob.masked_fill_(mask_corr, 0)
-
-                del ref_init_out, ref_init_logits, ref_corr_out, ref_corr_logits
-                torch.cuda.empty_cache()
-
-            # 计算 reward
-            corr_output_text = self.processing_class.batch_decode(corr_tokens, skip_special_tokens=True)
-            with torch.no_grad():
-                reward_corr = torch.tensor([
-                    self.reward_model(model_answer=corr_output, ground_truth=reference)
-                    for (corr_output, reference) in zip(corr_output_text, data[self.algo_config["gold_col"]])
-                ], dtype=torch.float, device=device)
-
-                reward_init = torch.tensor([
-                    self.reward_model(model_answer=init_output, ground_truth=reference)
-                    for (init_output, reference) in zip(init_answer_texts, data[self.algo_config["gold_col"]])
-                ], dtype=torch.float, device=device)
-
+            # --------------------------
+            # 2) ref logprobs (chunked)
+            # --------------------------
+            chunk_size = args.local_rollout_forward_batch_size if args.local_rollout_forward_batch_size > 0 else 1
+            ref_init_logprob, mask_init = compute_ref_logprobs_chunked(self.ref_policy, init_outputs, init_context_len, chunk_size)
+            ref_corr_logprob, mask_corr = compute_ref_logprobs_chunked(self.ref_policy, corr_outputs, corr_context_len, chunk_size)
             torch.cuda.empty_cache()
-            gc.collect()
 
-            # ------------------------
-            # 3) 计算 Loss (符合论文公式)
-            # ------------------------
-            # 论文 Stage I: max E[r(y2)] - β·KL(π_θ(·|x1) || π_ref(·|x1))
-            # 论文 Stage II: max E[r(y1) + r̃(y2)] - β·(KL_1 + KL_2)
-            # 
-            # 关键点：KL 是独立的正则化项，需要有梯度！
-            # Policy gradient 部分使用 baseline 减均值
+            # --------------------------
+            # 3) rewards (batch)
+            # --------------------------
+            corr_output_text = self.processing_class.batch_decode(corr_tokens, skip_special_tokens=True)
+            init_answer_texts_local = init_answer_texts
+            with torch.no_grad():
+                reward_corr = self._batch_score_reward(corr_output_text, data[self.algo_config["gold_col"]])
+                reward_init = self._batch_score_reward(init_answer_texts_local, data[self.algo_config["gold_col"]])
+            torch.cuda.empty_cache()
+            if step_idx % 100 == 0:
+                gc.collect()
 
-            micro_step = 0
-            total_loss = 0
-            # 用于日志记录 KL，Stage 1/2 均累积两项
-            total_kl_init = 0
-            total_kl_corr = 0
-            
-            for micro_start in range(0, args.local_batch_size, args.per_device_train_batch_size):                
+            # --------------------------
+            # 4) EMA Baselines
+            # --------------------------
+            with torch.no_grad():
+                baseline_init = self.compute_ema_baseline(reward_init, "init")
+                baseline_corr = self.compute_ema_baseline(reward_corr, "corr")
+                
+                if args.stage == 2:
+                    reward_delta = torch.clamp(reward_corr - reward_init, min=-0.5, max=0.5)
+                    r2_tilde = reward_corr + args.stage2_alpha * reward_delta
+                    baseline_r2_tilde = self.compute_ema_baseline(r2_tilde, "r2_tilde")
+
+            # --------------------------
+            # 5) Loss & gradient (micro-batches)
+            # --------------------------
+            total_loss = 0.0
+            total_kl_init = 0.0
+            total_kl_corr = 0.0
+            total_logprob_init = 0.0
+
+            percent_neg_init = 0.0
+            percent_neg_corr = 0.0
+            raw_kl_init = 0.0
+            raw_kl_corr = 0.0
+
+            for micro_idx, micro_start in enumerate(range(0, args.local_batch_size, args.per_device_train_batch_size)):
                 micro_end = micro_start + args.per_device_train_batch_size
                 mb_idx = slice(micro_start, micro_end)
+
                 mb_corr_outputs = corr_outputs[mb_idx]
                 mb_corr_tokens = corr_tokens[mb_idx]
-                mb_init_tokens = init_answers[mb_idx]
                 mb_init_outputs = init_outputs[mb_idx]
+                mb_init_tokens = init_answers[mb_idx]
                 mb_reward_corr = reward_corr[mb_idx]
                 mb_reward_init = reward_init[mb_idx]
                 mb_ref_init_logprob = ref_init_logprob[mb_idx]
@@ -497,281 +611,221 @@ class SCoRETrainer(Trainer):
                 mb_queries = queries[mb_idx]
                 mb_init_context_len = mb_queries.shape[1]
 
-                # ========== 计算当前策略的 log prob (需要梯度) ==========
-                # Stage I 和 Stage II 都需要计算 y1 和 y2 的 logprob
-                # 区别：
-                # - Stage I: y1 的 logprob 仅用于 KL 约束，不做 PG
-                # - Stage II: y1 的 logprob 用于 KL 约束 + PG
-                
-                # y1 的 log prob（Stage I/II 都需要，用于 KL 约束）
-                out_init = forward(self.model, mb_init_outputs, self.processing_class.pad_token_id)
-                logits_init = out_init.logits[:, mb_init_context_len - 1 : -1]
-                logprob_init = selective_log_softmax(logits_init, mb_init_tokens)
-                logprob_init = logprob_init.masked_fill_(mb_mask_init, 0)
-                
-                # y2 的 log prob（Stage I/II 都需要）
-                out_corr = forward(self.model, mb_corr_outputs, self.processing_class.pad_token_id)
-                logits_corr = out_corr.logits[:, corr_context_len - 1 : -1]
-                logprob_corr = selective_log_softmax(logits_corr, mb_corr_tokens)
-                logprob_corr = logprob_corr.masked_fill_(mb_mask_corr, 0)
+                # forward model for initial/correction outputs (with gradients)
+                out_init = forward(self.model, mb_init_outputs, pad_id)
+                logits_init_for_gen = logits_slice_for_generated(out_init.logits, mb_init_outputs, mb_init_context_len)
+                logprob_init = selective_log_softmax(logits_init_for_gen, mb_init_tokens)
+                logprob_init = logprob_init.masked_fill_(mb_mask_init, 0.0)
+                del out_init, logits_init_for_gen
+                torch.cuda.empty_cache()
 
-                # ========== 计算 Policy Gradient Loss ==========
+                out_corr = forward(self.model, mb_corr_outputs, pad_id)
+                logits_corr_for_gen = logits_slice_for_generated(out_corr.logits, mb_corr_outputs, corr_context_len)
+                logprob_corr = selective_log_softmax(logits_corr_for_gen, mb_corr_tokens)
+                logprob_corr = logprob_corr.masked_fill_(mb_mask_corr, 0.0)
+                del out_corr, logits_corr_for_gen
+                torch.cuda.empty_cache()
+
+                # Stage-specific computations
                 sum_lp_corr = logprob_corr.sum(dim=1)
+                sum_lp_init = logprob_init.sum(dim=1)
 
                 if args.stage == 1:
-                    # ============================================================
-                    # Stage I: 初始化阶段（论文 Section 4.1 + 5.1）
-                    # ============================================================
-                    # 完整目标: max E[r(y2)] - β1·D_KL(π_θ(y1|x) || π_ref(y1|x)) 
-                    #                          - β2·D_KL(π_θ(y2|x,y1) || π_ref(y2|x,y1))
-                    # 
-                    # 关键点：
-                    # 1. y1 来自 ref_policy（离线数据），不做 Policy Gradient
-                    # 2. 但需要 KL 约束，确保模型在生成 y1 时保持接近 base model
-                    # 3. y2 做 Policy Gradient + KL 约束，学习纠错能力
-                    # 4. 双重 KL 约束防止模型崩溃到"直接解决方案"
-                    # ============================================================
-                    
+                    # 1. PG loss on y2
+                    adv_corr = reward_corr - baseline_corr
+                    adv_corr_mb = adv_corr[mb_idx]
+                    adv_corr_mb = adv_corr_mb / (reward_corr.std() + 1e-8)
+                    adv_corr_mb = torch.clamp(adv_corr_mb, min=-5.0, max=5.0)
+                    loss_pg_corr = -(adv_corr_mb * sum_lp_corr).mean()
+
+                    # 2. SFT loss on y1
+                    loss_sft_init = -args.beta2_kl * sum_lp_init.mean()
+
+                    loss = loss_pg_corr + loss_sft_init
+
+                    # 3. 诊断指标（不参与梯度，不使用 softplus）
                     with torch.no_grad():
-                        baseline_corr = reward_corr.mean()
-                        advantage_corr = (mb_reward_corr - baseline_corr)
-
-                    # Policy Gradient: 只优化 y2
-                    sum_lp_corr = logprob_corr.sum(dim=1)
-                    loss_pg_corr = -(advantage_corr * sum_lp_corr).mean()
-
-                    # KL 正则化: 约束 y1 和 y2
-                    valid_mask_init = (~mb_mask_init).float()
-                    valid_mask_corr = (~mb_mask_corr).float()
+                        # 直接计算原始 KL（不用 softplus）
+                        valid_mask_init = (~mb_mask_init).float()
+                        kl_per_token_init = (logprob_init - mb_ref_init_logprob) * valid_mask_init
+                        seq_len_init = valid_mask_init.sum(dim=1).clamp(min=1.0)
+                        raw_kl_init_sample = kl_per_token_init.sum(dim=1) / seq_len_init
+                        
+                        total_kl_init += raw_kl_init_sample.mean().item()  # 不用 softplus
+                        total_logprob_init += sum_lp_init.mean().item()
+                        percent_neg_init = (raw_kl_init_sample < 0).float().mean().item()
+                        raw_kl_init = raw_kl_init_sample.mean().item()
                     
-                    # y1 的 KL: 确保模型生成 y1 时接近 base model
-                    kl_init_per_token = (logprob_init - mb_ref_init_logprob) * valid_mask_init
-                    len_init = valid_mask_init.sum(dim=1).clamp(min=1.0)
-                    kl_init_per_sample = kl_init_per_token.sum(dim=1) / len_init
-                    kl_init_per_sample = torch.clamp(kl_init_per_sample, min=0.0)
-                    loss_kl_init = args.init_kl_coef * kl_init_per_sample.mean()
-                    
-                    # y2 的 KL: 确保纠错时不过度偏离
-                    kl_corr_per_token = (logprob_corr - mb_ref_corr_logprob) * valid_mask_corr
-                    len_corr = valid_mask_corr.sum(dim=1).clamp(min=1.0)
-                    kl_corr_per_sample = kl_corr_per_token.sum(dim=1) / len_corr
-                    kl_corr_per_sample = torch.clamp(kl_corr_per_sample, min=0.0)
-                    loss_kl_corr = args.corr_kl_coef * kl_corr_per_sample.mean()
-
-                    # Stage I 总损失: PG(y2) + KL(y1) + KL(y2)
-                    loss = loss_pg_corr + loss_kl_init + loss_kl_corr
-                    
-                    # 日志记录
-                    total_kl_init += kl_init_per_sample.detach().mean().item()
-                    total_kl_corr += kl_corr_per_sample.detach().mean().item()
+                    percent_neg_corr = 0.0
+                    raw_kl_corr = 0.0
 
                 else:
-                    # ============================================================
-                    # Stage II: 联合优化阶段（论文 Section 4.2）
-                    # ============================================================
-                    # 论文公式: max E[r(y1) + r̃(y2)] - β·(KL_1 + KL_2)
-                    # 其中 r̃(y2) = r(y2) + α·(r(y2) - r(y1))
-                    # 
-                    # 关键理解：
-                    # "联合优化"是指整体目标函数包含两项奖励
-                    # 但 REINFORCE 梯度应该分离：
-                    # - y1 的梯度由 r(y1) 驱动
-                    # - y2 的梯度由 r̃(y2) 驱动
-                    # ============================================================
-                    sum_lp_init = logprob_init.sum(dim=1)
+                    # Stage II: PG on y1 and y2 with weak KL
                     
-                    # 计算 y2 的增强奖励（带 reward bonus）
-                    r2_tilde = mb_reward_corr + args.stage2_alpha * (mb_reward_corr - mb_reward_init)
+                    # Advantages
+                    adv_init = reward_init - baseline_init
+                    adv_init_mb = adv_init[mb_idx]
+                    adv_init_mb = adv_init_mb / (reward_init.std() + 1e-8)
+                    adv_init_mb = torch.clamp(adv_init_mb, min=-5.0, max=5.0)
                     
-                    with torch.no_grad():
-                        # 使用整个 local batch 计算 baseline（减少方差）
-                        baseline_init = reward_init.mean()
-                        
-                        all_r2_tilde = reward_corr + args.stage2_alpha * (reward_corr - reward_init)
-                        baseline_corr = all_r2_tilde.mean()
-                        
-                        # 分离的 advantage
-                        advantage_init = mb_reward_init - baseline_init  # y1 优化自身准确率
-                        advantage_corr = r2_tilde - baseline_corr        # y2 优化纠错+bonus
-                    
-                    # Policy Gradient: 分离优化
-                    # y1: 最大化首轮准确率
-                    loss_pg_init = -(advantage_init * sum_lp_init).mean()
-                    # y2: 最大化纠错准确率 + 纠错增益奖励
-                    loss_pg_corr = -(advantage_corr * sum_lp_corr).mean()
-                    
-                    # KL 正则化（长度归一化版本，与 Stage I 保持一致）
-                    valid_mask_init = (~mb_mask_init).float()
-                    valid_mask_corr = (~mb_mask_corr).float()
-                    
-                    kl_init_per_token = (logprob_init - mb_ref_init_logprob) * valid_mask_init
-                    kl_corr_per_token = (logprob_corr - mb_ref_corr_logprob) * valid_mask_corr
-                    
-                    len_init = valid_mask_init.sum(dim=1).clamp(min=1.0)
-                    len_corr = valid_mask_corr.sum(dim=1).clamp(min=1.0)
-                    
-                    kl_init_per_sample = kl_init_per_token.sum(dim=1) / len_init
-                    kl_corr_per_sample = kl_corr_per_token.sum(dim=1) / len_corr
-                    
-                    kl_init_per_sample = torch.clamp(kl_init_per_sample, min=0.0)
-                    kl_corr_per_sample = torch.clamp(kl_corr_per_sample, min=0.0)
-                    
-                    # KL 损失: β·(KL_1 + KL_2)
-                    loss_kl_init = args.init_kl_coef * kl_init_per_sample.mean()
-                    loss_kl_corr = args.corr_kl_coef * kl_corr_per_sample.mean()
-                    loss_kl = loss_kl_init + loss_kl_corr
-                    
-                    # 总损失: 论文公式的负数形式
-                    # -max E[r(y1) + r̃(y2)] + β·(KL_1 + KL_2)
-                    # = min -E[r(y1)] - E[r̃(y2)] + β·(KL_1 + KL_2)
-                    loss = loss_pg_init + loss_pg_corr + loss_kl
-                    
-                    # 记录用于日志
-                    total_kl_init += kl_init_per_sample.detach().mean().item()
-                    total_kl_corr += kl_corr_per_sample.detach().mean().item()
-                loss = loss / self.algo_config['gradient_accumulation_steps']
-                total_loss += loss.item()
+                    adv_corr = r2_tilde - baseline_r2_tilde
+                    adv_corr_mb = adv_corr[mb_idx]
+                    adv_corr_mb = adv_corr_mb / (r2_tilde.std() + 1e-8)
+                    adv_corr_mb = torch.clamp(adv_corr_mb, min=-5.0, max=5.0)
+
+                    # PG losses
+                    loss_pg_init = -(adv_init_mb * sum_lp_init).mean()
+                    loss_pg_corr = -(adv_corr_mb * sum_lp_corr).mean()
+
+                    # KL losses
+                    kl_init_sample, pct_neg_init, raw_init = compute_kl_robust(
+                        logprob_init, mb_ref_init_logprob, mb_mask_init
+                    )
+                    kl_corr_sample, pct_neg_corr, raw_corr = compute_kl_robust(
+                        logprob_corr, mb_ref_corr_logprob, mb_mask_corr
+                    )
+
+                    loss_kl_init = args.beta1_kl * kl_init_sample.mean()
+                    loss_kl_corr = args.beta1_kl * kl_corr_sample.mean()
+
+                    loss = loss_pg_init + loss_pg_corr + loss_kl_init + loss_kl_corr
+
+                    total_kl_init += kl_init_sample.detach().mean().item()
+                    total_kl_corr += kl_corr_sample.detach().mean().item()
+
+                    percent_neg_init = pct_neg_init
+                    percent_neg_corr = pct_neg_corr
+                    raw_kl_init = raw_init
+                    raw_kl_corr = raw_corr
+
+                # gradient accumulation
+                loss = loss / float(num_micro_batches)
+                total_loss += float(loss.item())
 
                 accelerator.backward(loss)
-                micro_step += 1
 
-                if micro_step == self.algo_config['gradient_accumulation_steps']:
+                # update on last micro-batch
+                if micro_idx == num_micro_batches - 1:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
                     self.optimizer.step()
                     self.lr_scheduler.step()
                     self.optimizer.zero_grad()
-                    micro_step = 0
 
-            # ------------------------
-            # Logging / stats
-            # ------------------------
+                # free mb-level tensors
+                del logprob_init, logprob_corr
+                torch.cuda.empty_cache()
+
+            # --------------------------
+            # 6) Logging
+            # --------------------------
             with torch.no_grad():
                 mean_reward_corr = accelerator.gather_for_metrics(reward_corr).mean().item()
                 mean_reward_init = accelerator.gather_for_metrics(reward_init).mean().item()
                 mean_reward_delta = mean_reward_corr - mean_reward_init
+
                 if 'reward_corr' not in ema_stats:
                     ema_stats['reward_corr'] = mean_reward_corr
+                    ema_stats['reward_init'] = mean_reward_init
                     ema_stats['reward_delta'] = mean_reward_delta
-                    ema_stats['kl_corr'] = total_kl_corr / max(1, args.local_batch_size // args.per_device_train_batch_size)
+                    ema_stats['kl_corr'] = total_kl_corr / max(1, num_micro_batches)
                 else:
-                    # 只有当字典里已经有值了，才进行平滑更新
-                    curr_kl = total_kl_corr / max(1, args.local_batch_size // args.per_device_train_batch_size)
+                    curr_kl = total_kl_corr / max(1, num_micro_batches)
                     ema_stats['reward_corr'] = (1 - ema_alpha) * ema_stats['reward_corr'] + ema_alpha * mean_reward_corr
+                    ema_stats['reward_init'] = (1 - ema_alpha) * ema_stats['reward_init'] + ema_alpha * mean_reward_init
                     ema_stats['reward_delta'] = (1 - ema_alpha) * ema_stats['reward_delta'] + ema_alpha * mean_reward_delta
                     ema_stats['kl_corr'] = (1 - ema_alpha) * ema_stats['kl_corr'] + ema_alpha * curr_kl
 
                 metrics = {}
-                metrics["score/kl_init"] = total_kl_init / max(1, args.local_batch_size // args.per_device_train_batch_size)
-                metrics["score/kl_corr"] = total_kl_corr / max(1, args.local_batch_size // args.per_device_train_batch_size)
+                metrics["score/kl_init"] = total_kl_init / max(1, num_micro_batches)
+                metrics["score/kl_corr"] = total_kl_corr / max(1, num_micro_batches)
                 metrics["score/reward_init"] = mean_reward_init
                 metrics["score/reward_corr"] = mean_reward_corr
-                metrics["score/reward_delta"] = mean_reward_corr - mean_reward_init  # 关键指标：纠错提升
+                metrics["score/reward_delta"] = mean_reward_delta
                 metrics["loss"] = total_loss
                 metrics["episode"] = self.state.episode
                 metrics["step"] = step_idx
                 metrics["score_ema/reward_corr"] = ema_stats['reward_corr']
+                metrics["score_ema/reward_init"] = ema_stats['reward_init']
                 metrics["score_ema/reward_delta"] = ema_stats['reward_delta']
                 metrics["score_ema/kl_corr"] = ema_stats['kl_corr']
+
+                # Baseline values
+                metrics["baseline/ema_init"] = self.ema_baseline_init if self.ema_baseline_init is not None else 0.0
+                metrics["baseline/ema_corr"] = self.ema_baseline_corr if self.ema_baseline_corr is not None else 0.0
+                
+                # Advantage std (measure of stability)
+                metrics["debug/std_advantage_init"] = (reward_init - baseline_init).std().item()
+                metrics["debug/std_advantage_corr"] = (reward_corr - baseline_corr).std().item()
+
+                if args.stage == 1:
+                    # Stage I specific metrics
+                    metrics["stage1/logprob_init"] = total_logprob_init / max(1, num_micro_batches)
+                    metrics["stage1/nll_init"] = -total_logprob_init / max(1, num_micro_batches)
+
+                if args.stage == 2:
+                    all_reward_delta = torch.clamp(reward_corr - reward_init, min=-0.5, max=0.5)
+                    all_r2_tilde = reward_corr + args.stage2_alpha * all_reward_delta
+                    mean_r2_tilde = accelerator.gather_for_metrics(all_r2_tilde).mean().item()
+                    metrics["debug/r2_tilde"] = mean_r2_tilde
+                    metrics["debug/alpha"] = args.stage2_alpha
+                    metrics["baseline/ema_r2_tilde"] = self.ema_baseline_r2_tilde if self.ema_baseline_r2_tilde is not None else 0.0
+                    if 'r2_tilde' not in ema_stats:
+                        ema_stats['r2_tilde'] = mean_r2_tilde
+                    else:
+                        ema_stats['r2_tilde'] = (1 - ema_alpha) * ema_stats['r2_tilde'] + ema_alpha * mean_r2_tilde
+                    metrics["score_ema/r2_tilde"] = ema_stats['r2_tilde']
+
+                # KL diagnostics
+                metrics["debug/raw_kl_init"] = raw_kl_init
+                metrics["debug/raw_kl_corr"] = raw_kl_corr
+                metrics["debug/percent_negative_kl_init"] = percent_neg_init
+                metrics["debug/percent_negative_kl_corr"] = percent_neg_corr
+
                 self.log(metrics)
 
-            del corr_outputs, corr_tokens, init_outputs, init_answers, queries
-            del out_corr, out_init, logits_corr, logits_init, logprob_corr, logprob_init
-            del ref_init_logprob, ref_corr_logprob, mask_init, mask_corr
+            # cleanup per-batch big tensors
+            try:
+                del corr_outputs, corr_tokens, init_outputs, init_answers, queries
+            except Exception:
+                pass
+            try:
+                del ref_init_logprob, ref_corr_logprob, mask_init, mask_corr
+            except Exception:
+                pass
             torch.cuda.empty_cache()
-            gc.collect()
+            if step_idx % 100 == 0:
+                gc.collect()
 
+            # step end housekeeping
             self.state.global_step += 1
             self.control = self.callback_handler.on_step_end(args, self.state, self.control)
             if self.control.should_save:
                 self._save_checkpoint(self.model, trial=None)
                 self.control = self.callback_handler.on_save(self.args, self.state, self.control)
 
-            # if (
-            #     args.num_sample_generations > 0
-            #     and (step_idx - 1) % max(1, args.num_total_batches // args.num_sample_generations) == 0
-            # ):
-            #     self.generate_completions(sampling=True)
-
-            # Early termination if needed
             if self.control.should_training_stop:
                 break
 
+        # final
         self.control = self.callback_handler.on_train_end(args, self.state, self.control)
         if self.control.should_save:
             self._save_checkpoint(self.model, trial=None)
             self.control = self.callback_handler.on_save(self.args, self.state, self.control)
 
-        print("SCoRE training completed!")
+        # optional final light eval
+        if self.eval_dataloader is not None:
+            eval_metrics = self.compute_eval_metrics(
+                max_batches=getattr(self.args, 'max_eval_batches', 64),
+                reward_threshold=getattr(self.args, 'eval_reward_threshold', 0.5)
+            )
+            if eval_metrics:
+                self.log(eval_metrics)
 
-    def generate_completions(self, sampling: bool = False):
+        print("✅ SCoRE training completed!")
+
+    def create_model_card(self, model_name: Optional[str] = None, dataset_name: Optional[str] = None, tags: Union[str, list[str], None] = None):
         """
-        Utility function to sample model completions on `eval_dataloader` and log them.
-        Copied from RLOOTrainer's style, but simplified.
-        """
-
-        raise NotImplementedError('Not Yet')
-
-        # args = self.args
-        # if self.eval_dataloader is None:
-        #     return
-
-        # generation_config = GenerationConfig(
-        #     max_new_tokens=args.response_length,
-        #     temperature=(0.01 + 1e-7),
-        #     top_k=0.0,
-        #     top_p=1.0,
-        #     do_sample=True,
-        # )
-
-        # table = defaultdict(list)
-        # with unwrap_model_for_generation(
-        #     self.model, self.accelerator, gather_deepspeed3_params=args.ds3_gather_for_generation
-        # ) as unwrapped_model:
-        #     for batch in self.eval_dataloader:
-        #         query = batch["input_ids"]
-        #         with torch.no_grad():
-        #             context_length = query.shape[1]
-        #             query_response, _ = batch_generation(
-        #                 unwrapped_model,
-        #                 query,
-        #                 query.shape[0],
-        #                 self.processing_class.pad_token_id,
-        #                 generation_config,
-        #             )
-        #             response = query_response[:, context_length:]
-        #             table["query"].extend(
-        #                 gather_object(self.processing_class.batch_decode(query, skip_special_tokens=True))
-        #             )
-        #             table["model response"].extend(
-        #                 gather_object(self.processing_class.batch_decode(response, skip_special_tokens=True))
-        #             )
-
-        #         if sampling:
-        #             # Just do one batch if sampling
-        #             break
-
-        # df = pd.DataFrame(table)
-        # if self.accelerator.is_main_process:
-        #     print_rich_table(df.iloc[0 : 0 + 5])
-        #     # If using W&B or Comet, you can log the table
-        #     # ...
-    
-    def create_model_card(
-        self,
-        model_name: Optional[str] = None,
-        dataset_name: Optional[str] = None,
-        tags: Union[str, list[str], None] = None,
-    ):
-        """
-        Creates a draft of a model card using the information available to the `Trainer`.
-
-        Args:
-            model_name (`str` or `None`, *optional*, defaults to `None`):
-                Name of the model.
-            dataset_name (`str` or `None`, *optional*, defaults to `None`):
-                Name of the dataset used for training.
-            tags (`str`, `list[str]` or `None`, *optional*, defaults to `None`):
-                Tags to be associated with the model card.
+        Generate a README / model card for the run.
         """
         if not self.is_world_process_zero():
             return
@@ -785,29 +839,24 @@ class SCoRETrainer(Trainer):
         if isinstance(tags, str):
             tags = [tags]
 
-        if hasattr(self.model.config, "unsloth_version"):
-            tags.append("unsloth")
-
         try:
             import wandb
             from wandb import run as wandb_run
             wandb_url = wandb_run.get_url() if wandb_run is not None else None
-        except ImportError:
+        except Exception:
             wandb_url = None
 
         model_card = generate_model_card(
             base_model=base_model,
             model_name=model_name,
-            hub_model_id=self.hub_model_id,
+            hub_model_id=getattr(self, "hub_model_id", None),
             dataset_name=dataset_name,
             tags=tags,
             wandb_url=wandb_url,
             comet_url=get_comet_experiment_url(),
             trainer_name="SCoRE",
         )
-
         model_card.save(os.path.join(self.args.output_dir, "README.md"))
-
 
 
 def build_correction_inputs_for_batch(
@@ -818,20 +867,17 @@ def build_correction_inputs_for_batch(
     question_col: str = "question",
     initial_answer_col: str = "initial_answer",
 ):
-    # We will store the final "correction input" for each row
+    """
+    Build correction inputs for a batch using prompt_builder.
+    Returns padded input_ids tensor for correction prompts.
+    """
     batch_correction_inputs = []
-
     for i, init_ans_text in enumerate(init_answer_texts):
         question_text = batch[question_col][i]
-
-        # Build a 'sample' dict as your prompt_builder expects:
         sample_for_prompt = {
             question_col: question_text,
-            initial_answer_col: [init_ans_text],  # your builder uses a list for initial answers
+            initial_answer_col: [init_ans_text],
         }
-
-        # Now get the final correction prompt(s). Typically there's 1 prompt
-        # in this scenario, but build_correction_prompt returns a list.
         corr_inputs = prompt_builder.build_correction_prompt(
             sample=sample_for_prompt,
             tokenizer=tokenizer,
@@ -839,11 +885,8 @@ def build_correction_inputs_for_batch(
             initial_answer_col=initial_answer_col,
             tokenize=True
         )
-        # Since we used only 1 initial answer, corr_prompts[0] is the final text
         corr_inputs = corr_inputs[0]
-
         batch_correction_inputs.append({'input_ids': corr_inputs})
-
 
     collated_corrections = DataCollatorWithPadding(tokenizer)(batch_correction_inputs)
     return collated_corrections['input_ids']
